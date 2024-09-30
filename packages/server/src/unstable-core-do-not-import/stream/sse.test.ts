@@ -1,7 +1,13 @@
+import { scheduler } from 'timers/promises';
 import { EventSourcePolyfill, NativeEventSource } from 'event-source-polyfill';
 import SuperJSON from 'superjson';
 import type { Maybe } from '../types';
-import { sseHeaders, sseStreamConsumer, sseStreamProducer } from './sse';
+import {
+  createStreamLock,
+  sseHeaders,
+  sseStreamConsumer,
+  sseStreamProducer,
+} from './sse';
 import { isTrackedEnvelope, sse, tracked } from './tracked';
 import { createServer } from './utils/createServer';
 
@@ -323,3 +329,54 @@ test('sse()', () => {
     extras: {},
   });
 });
+
+test('createStreamLock - can lock a stream and cancel it', async () => {
+  const lock = createStreamLock();
+
+  let counter = 1;
+  const operations: string[] = [];
+
+  async function increment() {
+    const result = await lock.get();
+    if (result === lock.DESTROYED) {
+      return;
+    }
+
+    operations.push(String(counter++));
+  }
+
+  async function holdLock(promise: Promise<void>) {
+    await lock.acquireLock(promise);
+
+    operations.push('lock held and released');
+  }
+
+  increment();
+  increment();
+
+  const resolvable = createResolvable();
+  holdLock(resolvable.promise);
+
+  increment();
+  resolvable.resolve();
+
+  increment();
+
+  await scheduler.yield();
+
+  expect(operations).toEqual([1, 2, 'lock held and released', 3, 4]);
+});
+
+function createResolvable() {
+  const NOOP = () => void 0;
+  let resolve: () => void = NOOP;
+  const promise = new Promise<void>((_resolve) => {
+    resolve = _resolve;
+  });
+
+  if (resolve === NOOP) {
+    throw 'Unlock not assigned';
+  }
+
+  return { promise, resolve };
+}

@@ -194,6 +194,8 @@ export function sseStreamConsumer<TData>(opts: {
   deserialize?: Deserialize;
   tryHandleError?: (error: Event) => Promise<boolean>;
 }): AsyncIterable<ConsumerStreamResult<TData>> {
+  const lock = createStreamLock();
+
   const { deserialize = (v) => v } = opts;
   const eventSource = opts.from;
 
@@ -228,14 +230,33 @@ export function sseStreamConsumer<TData>(opts: {
     },
   });
 
-  eventSource.addEventListener('message', (msg) => {
+  eventSource.addEventListener('message', async (msg) => {
+    const result = await lock.get();
+    if (result === lock.DESTROYED) {
+      return;
+    }
+
     stream.controller.enqueue(msg);
   });
-  eventSource.addEventListener(SERIALIZED_ERROR_EVENT, (msg) => {
+
+  eventSource.addEventListener(SERIALIZED_ERROR_EVENT, async (msg) => {
+    const result = await lock.get();
+    if (result === lock.DESTROYED) {
+      return;
+    }
+
     stream.controller.enqueue(msg);
   });
+
   eventSource.addEventListener('error', async (cause) => {
-    const handled = await opts.tryHandleError?.(cause);
+    const handled = opts.tryHandleError
+      ? await lock.acquireLock(opts.tryHandleError?.(cause))
+      : false;
+
+    if (handled === lock.DESTROYED) {
+      return;
+    }
+
     if (handled === true) {
       return;
     }
@@ -266,6 +287,8 @@ export function sseStreamConsumer<TData>(opts: {
           };
         },
         async return() {
+          lock.destroy();
+
           reader.releaseLock();
           return {
             value: undefined,
@@ -276,6 +299,69 @@ export function sseStreamConsumer<TData>(opts: {
       return iterator;
     },
   };
+}
+
+/**
+ * Allows us to pause a stream until
+ */
+const DESTROYED = Symbol('DESTROYED');
+export function createStreamLock() {
+  const UNRESOLVED = new Promise(() => void 0);
+  const RESOLVED = Promise.resolve();
+  const NOOP = () => {
+    //
+  };
+  let lock: Promise<unknown> = RESOLVED;
+  let destroyed = false;
+
+  return {
+    DESTROYED,
+    async acquireLock<T>(_promise: Promise<T>): Promise<T | typeof DESTROYED> {
+      await lock.catch(NOOP);
+      if (destroyed) {
+        return DESTROYED;
+      }
+
+      lock = UNRESOLVED;
+
+      try {
+        return await _promise;
+      } finally {
+        // Switch to resolved promise not to leak memory
+        setTimeout(() => {
+          lock = RESOLVED;
+        }, 1000);
+      }
+    },
+    async get(): Promise<void | typeof DESTROYED> {
+      await lock.catch(NOOP);
+
+      if (destroyed) {
+        return DESTROYED;
+      }
+    },
+    /**
+     * Call when the parent feed has been destroyed to cancel any waiting locks
+     */
+    destroy() {
+      destroyed = true;
+      lock = RESOLVED;
+    },
+  };
+}
+
+export function createResolvable() {
+  const NOOP = () => void 0;
+  let resolve: () => void = NOOP;
+  const promise = new Promise<void>((_resolve) => {
+    resolve = _resolve;
+  });
+
+  if (resolve === NOOP) {
+    throw 'Unlock not assigned';
+  }
+
+  return { promise, resolve };
 }
 
 export const sseHeaders = {
