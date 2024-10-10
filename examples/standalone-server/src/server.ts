@@ -63,6 +63,7 @@ const postRouter = router({
 const appRouter = router({
   greeting: greetingRouter,
   post: postRouter,
+  helloWorld: publicProcedure.query(() => 'Hello World'),
 });
 
 export type AppRouter = typeof appRouter;
